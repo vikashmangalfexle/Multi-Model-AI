@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 # ------------------ ENV CONFIG ------------------
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://postgres:password@localhost:5432/yourdb")
+origins = os.getenv("ALLOWED_ORIGINS", "").split(",")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
@@ -50,7 +51,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: restrict in prod
+    allow_origins=origins,  # TODO: restrict in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -225,3 +226,4 @@ def feedback(data: FeedbackRequest):
         return {"message": "Feedback saved and stats updated"}
     finally:
         db.close()
+
