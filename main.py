@@ -18,13 +18,27 @@ SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
 # ------------------ DB MODELS ------------------
+class Conversation(Base):
+    __tablename__ = "conversations"
+    id = Column(Integer, primary_key=True)
+    title = Column(String(255), nullable=True)
+    domain = Column(String(50), nullable=True)   # ✅ persist domain
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    prompts = relationship("Prompt", back_populates="conversation", cascade="all, delete")
+
+
 class Prompt(Base):
     __tablename__ = "ai_prompts"
     id = Column(Integer, primary_key=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id", ondelete="CASCADE"))
     prompt = Column(Text, nullable=False)
     domain = Column(String(50), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
     responses = relationship("Response", back_populates="prompt", cascade="all, delete")
+    conversation = relationship("Conversation", back_populates="prompts")
+
 
 class Response(Base):
     __tablename__ = "ai_responses"
@@ -34,7 +48,9 @@ class Response(Base):
     content = Column(Text, nullable=False)
     rating = Column(Integer)
     created_at = Column(DateTime, default=datetime.utcnow)
+
     prompt = relationship("Prompt", back_populates="responses")
+
 
 class ProviderStats(Base):
     __tablename__ = "provider_stats"
@@ -44,6 +60,7 @@ class ProviderStats(Base):
     avg_rating = Column(Float, default=0)
     rating_count = Column(Integer, default=0)
 
+
 Base.metadata.create_all(bind=engine)
 
 # ------------------ FASTAPI APP ------------------
@@ -51,7 +68,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # TODO: restrict in prod
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -59,9 +76,6 @@ app.add_middleware(
 
 # ------------------ HELPERS ------------------
 def detect_domain_gemini(prompt: str) -> str:
-    """
-    Use Gemini API to classify the domain of the prompt.
-    """
     try:
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
         headers = {"X-goog-api-key": os.getenv("GEMINI_API_KEY")}
@@ -69,10 +83,8 @@ def detect_domain_gemini(prompt: str) -> str:
             "contents": [{
                 "parts": [{
                     "text": (
-                        "Classify the following text into one of these domains: "
-                        "programming, finance, health, education, creative, general.\n\n"
-                        f"Text: {prompt}\n\n"
-                        "Return only the domain name."
+                        "Classify into one of: programming, finance, health, education, creative, general.\n\n"
+                        f"Text: {prompt}\n\nReturn only the domain."
                     )
                 }]
             }]
@@ -80,40 +92,52 @@ def detect_domain_gemini(prompt: str) -> str:
         r = requests.post(url, headers=headers, json=body, timeout=15)
         r.raise_for_status()
         domain = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip().lower()
-        valid_domains = ["programming", "finance", "health", "education", "creative", "general"]
-        return domain if domain in valid_domains else "general"
+        return domain if domain in ["programming", "finance", "health", "education", "creative", "general"] else "general"
     except Exception as e:
         print(f"[WARN] Gemini domain detection failed: {e}")
         return "general"
 
+
 def get_top_providers(db, domain: str, threshold=4):
-    """
-    Fetch providers with avg_rating >= threshold for a given domain.
-    """
     stats = db.query(ProviderStats).filter(ProviderStats.domain == domain).all()
     return [s.provider for s in stats if s.avg_rating >= threshold]
 
-def query_ai_models(prompt: str, providers: list[str]) -> dict:
-    """
-    Query selected AI providers for responses.
-    """
+SYSTEM_PROMPT = """
+You are an assistant inside a multi-AI chat app.
+If the user asks "what does this app do", "how does this work", "who are you", 
+or anything similar, always explain clearly:
+
+- The app connects to multiple AI providers (OpenAI, Gemini, Grok).
+- It automatically detects the domain of the query (programming, finance, health, etc.).
+- It can optimize by using top-rated providers for that domain.
+- Users can rate responses, and the system learns over time.
+- Conversations and feedback are stored for personalization.
+
+Answer in a friendly, concise way unless the user asks for more detail.
+Don't give app details unless asked.
+"""
+def query_ai_models_with_history(prompt: str, history: list[dict], providers: list[str]) -> dict:
     responses = {}
+    # Always prepend system prompt
+    history = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+
     for p in providers:
         try:
             if p == "openai":
                 r = requests.post(
                     "https://api.openai.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"},
-                    json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}]}
+                    json={"model": "gpt-4o-mini", "messages": history + [{"role": "user", "content": prompt}]}
                 )
                 r.raise_for_status()
                 responses[p] = r.json()["choices"][0]["message"]["content"]
 
             elif p == "gemini":
+                full_context = "\n".join([f"{h['role']}: {h['content']}" for h in history]) + f"\nuser: {prompt}"
                 r = requests.post(
                     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
                     headers={"X-goog-api-key": os.getenv("GEMINI_API_KEY")},
-                    json={"contents": [{"parts": [{"text": prompt}]}]}
+                    json={"contents": [{"parts": [{"text": full_context}]}]}
                 )
                 r.raise_for_status()
                 responses[p] = r.json()["candidates"][0]["content"]["parts"][0]["text"]
@@ -122,14 +146,13 @@ def query_ai_models(prompt: str, providers: list[str]) -> dict:
                 r = requests.post(
                     "https://api.x.ai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {os.getenv('XAI_API_KEY')}"},
-                    json={"model": "grok-1", "messages": [{"role": "user", "content": prompt}]}
+                    json={"model": "grok-1", "messages": history + [{"role": "user", "content": prompt}]}
                 )
                 r.raise_for_status()
                 responses[p] = r.json()["choices"][0]["message"]["content"]
 
             else:
                 responses[p] = "Provider not implemented"
-
         except Exception as e:
             responses[p] = f"Error: {e}"
     return responses
@@ -137,7 +160,9 @@ def query_ai_models(prompt: str, providers: list[str]) -> dict:
 # ------------------ REQUEST SCHEMAS ------------------
 class PromptRequest(BaseModel):
     prompt: str
-    optimized: bool = True
+    optimized: bool = False
+    conversation_id: int | None = None
+
 
 class FeedbackRequest(BaseModel):
     prompt_id: int
@@ -149,43 +174,64 @@ class FeedbackRequest(BaseModel):
 def generate(data: PromptRequest):
     db = SessionLocal()
     try:
-        # Detect domain for this prompt
-        domain = detect_domain_gemini(data.prompt)
+        # If no conversation -> new one
+        if not data.conversation_id:
+            conversation = Conversation(title=data.prompt[:50])
+            db.add(conversation)
+            db.commit()
+            db.refresh(conversation)
+            conversation_id = conversation.id
+        else:
+            conversation = db.query(Conversation).get(data.conversation_id)
+            if not conversation:
+                raise HTTPException(404, "Conversation not found")
+            conversation_id = conversation.id
 
-        # Get top providers if domain has high rated ones
+        # Build history (last 5 turns)
+        history = []
+        for p in conversation.prompts[-5:]:
+            history.append({"role": "user", "content": p.prompt})
+            for r in p.responses:
+                history.append({"role": "assistant", "content": r.content})
+
+        # Domain: reuse if set, else detect and store
+        if conversation.domain:
+            domain = conversation.domain
+        else:
+            domain = detect_domain_gemini(data.prompt)
+            conversation.domain = domain
+            db.commit()
+
+        # Providers
         top_providers = get_top_providers(db, domain)
         all_providers = ["openai", "gemini", "grok"]
+        providers_to_use = top_providers if data.optimized and top_providers else all_providers
+        mode = "rated" if providers_to_use == top_providers else "explore"
 
-        if data.optimized and top_providers:  # Existing high-rated provider(s)
-            providers_to_use = top_providers
-            mode = "rated"
-        else:  # New domain or no good ratings yet → show all
-            providers_to_use = all_providers
-            mode = "explore"
+        # Query models
+        ai_responses = query_ai_models_with_history(data.prompt, history, providers_to_use)
 
-        # Query AI providers
-        ai_responses = query_ai_models(data.prompt, providers_to_use)
-
-        # Save prompt
-        new_prompt = Prompt(prompt=data.prompt, domain=domain)
+        # Save prompt + responses
+        new_prompt = Prompt(prompt=data.prompt, domain=domain, conversation_id=conversation_id)
         db.add(new_prompt)
         db.commit()
         db.refresh(new_prompt)
 
-        # Save responses
         for provider, content in ai_responses.items():
             db.add(Response(prompt_id=new_prompt.id, provider=provider, content=content))
         db.commit()
 
         return {
+            "conversation_id": conversation_id,
             "prompt_id": new_prompt.id,
             "domain": domain,
-            "mode": mode,  # "explore" (all providers) or "rated" (top providers only)
+            "mode": mode,
             "providers_used": providers_to_use,
-            "responses": ai_responses
+            "responses": ai_responses,
         }
     finally:
         db.close()
+
 
 @app.post("/feedback")
 def feedback(data: FeedbackRequest):
@@ -198,11 +244,9 @@ def feedback(data: FeedbackRequest):
         if not resp:
             raise HTTPException(status_code=404, detail="Response not found")
 
-        # Save feedback
         resp.rating = data.rating
         db.commit()
 
-        # Update provider stats
         prompt = resp.prompt
         stat = db.query(ProviderStats).filter(
             ProviderStats.domain == prompt.domain,
@@ -210,12 +254,7 @@ def feedback(data: FeedbackRequest):
         ).first()
 
         if not stat:
-            stat = ProviderStats(
-                domain=prompt.domain,
-                provider=data.provider,
-                avg_rating=data.rating,
-                rating_count=1
-            )
+            stat = ProviderStats(domain=prompt.domain, provider=data.provider, avg_rating=data.rating, rating_count=1)
             db.add(stat)
         else:
             total = stat.avg_rating * stat.rating_count
@@ -227,3 +266,15 @@ def feedback(data: FeedbackRequest):
     finally:
         db.close()
 
+
+@app.post("/new_conversation")
+def new_conversation():
+    db = SessionLocal()
+    try:
+        convo = Conversation(title="New Chat", domain=None)
+        db.add(convo)
+        db.commit()
+        db.refresh(convo)
+        return {"conversation_id": convo.id}
+    finally:
+        db.close()
